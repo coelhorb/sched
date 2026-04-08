@@ -98,17 +98,17 @@ function cron_to_human(expr, skip,    p, min, hour, dom, month, dow, N, w) {
     split(expr, p, " ")
     min = p[1]; hour = p[2]; dom = p[3]; month = p[4]; dow = p[5]
 
-    if (match(min, /^\*\/([0-9]+)$/, p) && hour=="*" && dom=="*" && month=="*" && dow=="*")
-        return "a cada " p[1] " minutos"
-    if (min=="0" && match(hour, /^\*\/([0-9]+)$/, p) && dom=="*" && month=="*" && dow=="*")
-        return "a cada " p[1] " horas"
-    if (min=="0" && hour=="0" && match(dom, /^\*\/([0-9]+)$/, p) && month=="*" && dow=="*") {
-        N = p[1]+0
+    if (match(min, /^\*\/[0-9]+$/) && hour=="*" && dom=="*" && month=="*" && dow=="*")
+        return "a cada " substr(min, 3) " minutos"
+    if (min=="0" && match(hour, /^\*\/[0-9]+$/) && dom=="*" && month=="*" && dow=="*")
+        return "a cada " substr(hour, 3) " horas"
+    if (min=="0" && hour=="0" && match(dom, /^\*\/[0-9]+$/) && month=="*" && dow=="*") {
+        N = substr(dom, 3)+0
         if (N % 7 == 0) { w = int(N/7); return (w == 1) ? "semanalmente" : "a cada " w " semanas" }
         return "a cada " N " dias"
     }
-    if (min=="0" && hour=="0" && dom=="1" && match(month, /^\*\/([0-9]+)$/, p) && dow=="*")
-        return "a cada " p[1] " meses"
+    if (min=="0" && hour=="0" && dom=="1" && match(month, /^\*\/[0-9]+$/) && dow=="*")
+        return "a cada " substr(month, 3) " meses"
     if (min=="0" && hour=="0" && dom ~ /^[0-9]+$/ && month=="*" && dow=="*")
         return "no dia " dom " de cada mês"
     if (min=="0" && hour=="0" && dom=="*" && month=="*" && dow ~ /^[0-6]$/) {
@@ -134,7 +134,7 @@ function crontab_read(    line, result) {
 #   id \t cron \t cmd \t logfile \t skip
 # Metadados no comentário: # sched-id:N | sched-skip:N | sched-log:p | sched-cmd:cmd
 # ===========================================================================
-function read_jobs_from(ct,    n, lines, i, line, id, logfile, dcmd, skip, np, parts, cron, j, result, ma, mb, mc) {
+function read_jobs_from(ct,    n, lines, i, line, id, logfile, dcmd, skip, np, parts, cron, j, result) {
     n = split(ct, lines, "\n")
     id = ""; logfile = ""; dcmd = ""; skip = 0; result = ""
 
@@ -142,10 +142,10 @@ function read_jobs_from(ct,    n, lines, i, line, id, logfile, dcmd, skip, np, p
         line = lines[i]
 
         if (line ~ /^# sched-id:/) {
-            id      = match(line, /sched-id:([0-9]+)/, ma)    ? ma[1]   : ""
-            logfile = match(line, /sched-log:([^ |]+)/, mb)   ? mb[1]   : ""
-            dcmd    = match(line, /sched-cmd:(.+)$/, mc)      ? mc[1]   : ""
-            skip    = match(line, /sched-skip:([0-9]+)/, ma)  ? ma[1]+0 : 0
+            id      = match(line, /sched-id:[0-9]+/)    ? substr(line, RSTART+9,  RLENGTH-9)    : ""
+            logfile = match(line, /sched-log:[^ |]+/)   ? substr(line, RSTART+10, RLENGTH-10)   : ""
+            dcmd    = match(line, /sched-cmd:.+/)        ? substr(line, RSTART+10)               : ""
+            skip    = match(line, /sched-skip:[0-9]+/)  ? substr(line, RSTART+11, RLENGTH-11)+0 : 0
             continue
         }
         if (line !~ /^#/ && line != "") {
@@ -190,11 +190,11 @@ function next_exec_cron(cron_expr,    p, cmin, chour, cdom, cmon, cdow, t, dt, m
 # ===========================================================================
 # last_exec_log — última execução registrada no log (linha [ts])
 # ===========================================================================
-function last_exec_log(logfile,    line, last, ma) {
+function last_exec_log(logfile,    line, last) {
     if (logfile == "") return "-"
     last = ""
     while ((getline line < logfile) > 0)
-        if (match(line, /^\[([0-9-]+ [0-9:]+)\]/, ma)) last = ma[1]
+        if (match(line, /^\[[0-9-]+ [0-9:]+\]/)) last = substr(line, 2, RLENGTH-2)
     close(logfile)
     return (last != "") ? last : "-"
 }
@@ -223,13 +223,13 @@ function find_job_by_id(target, jobs,    n, lines, i, np, parts) {
 # delete_and_renumber — remove job com target ID e renumera os restantes
 # ct: conteúdo do crontab já lido (evita segunda chamada ao sistema)
 # ===========================================================================
-function delete_and_renumber(target, ct,    n, lines, i, line, skip_next, c, result, ma) {
+function delete_and_renumber(target, ct,    n, lines, i, line, skip_next, c, result) {
     n = split(ct, lines, "\n")
     skip_next = 0; c = 0; result = ""
     for (i = 1; i <= n; i++) {
         line = lines[i]
-        if (match(line, /^# sched-id:([0-9]+)/, ma)) {
-            if (ma[1] == target) { skip_next = 1; continue }
+        if (match(line, /^# sched-id:[0-9]+/)) {
+            if (substr(line, RSTART+11, RLENGTH-11) == target) { skip_next = 1; continue }
             c++
             sub(/sched-id:[0-9]+/, "sched-id:" c, line)
             result = result line "\n"; continue
@@ -496,7 +496,7 @@ function cmd_descreva(    target_id, jobs, freq, nxt, last) {
 # cmd_rodar
 # ===========================================================================
 function cmd_rodar(    command, ct, next_id, ctlines, n, i, cmd_cron, logdir, label_esc,
-                       freq_human, comment, cmd_cron_safe, ma) {
+                       freq_human, comment, cmd_cron_safe) {
     if (N_ARGS == 0) {
         printf "Erro: informe a frequência e o comando.\n" > "/dev/stderr"
         usage_stderr(); exit 1
@@ -513,8 +513,9 @@ function cmd_rodar(    command, ct, next_id, ctlines, n, i, cmd_cron, logdir, la
     next_id = 1
     n = split(ct, ctlines, "\n")
     for (i = 1; i <= n; i++)
-        if (match(ctlines[i], /sched-id:([0-9]+)/, ma) && ma[1]+0 >= next_id)
-            next_id = ma[1]+0 + 1
+        if (match(ctlines[i], /sched-id:[0-9]+/) &&
+            substr(ctlines[i], RSTART+9, RLENGTH-9)+0 >= next_id)
+            next_id = substr(ctlines[i], RSTART+9, RLENGTH-9)+0 + 1
 
     # Monta o comando que vai para o crontab
     cmd_cron = command
