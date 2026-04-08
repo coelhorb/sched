@@ -1,0 +1,619 @@
+#!/usr/bin/env -S gawk -f
+# sched — Gerenciador de agendamentos cron em Português do Brasil
+# Dependências: gawk, crontab, column
+
+# ===========================================================================
+# BEGIN — ponto de entrada principal
+# ===========================================================================
+BEGIN {
+    setup()
+
+    subcmd = (ARGC > 1) ? ARGV[1] : ""
+    N_ARGS = 0
+    for (_i = 2; _i < ARGC; _i++) ARGS[N_ARGS++] = ARGV[_i]
+    for (_i = 1; _i < ARGC; _i++) delete ARGV[_i]
+    ARGC = 1
+
+    "mktemp /tmp/sched.XXXXXX" | getline TMPFILE
+    close("mktemp /tmp/sched.XXXXXX")
+
+    if      (subcmd == "rodar")    cmd_rodar()
+    else if (subcmd == "listar")   cmd_listar()
+    else if (subcmd == "descreva") cmd_descreva()
+    else if (subcmd == "deletar")  cmd_deletar()
+    else if (subcmd ~ /^(ajuda|--ajuda|help|--help|-h)$/) { usage(); exit 0 }
+    else if (subcmd == "")         { usage(); exit 1 }
+    else {
+        printf "Subcomando desconhecido: \"%s\"\n\n", subcmd > "/dev/stderr"
+        usage_stderr(); exit 1
+    }
+
+    exit 0
+}
+
+END { if (TMPFILE != "") system("rm -f " TMPFILE) }
+
+# ===========================================================================
+# setup — inicializa tabelas globais
+# ===========================================================================
+function setup() {
+    DOW_PT[0] = "domingo";        DOW_PT_PL[0] = "domingos"
+    DOW_PT[1] = "segunda-feira";  DOW_PT_PL[1] = "segundas"
+    DOW_PT[2] = "terça-feira";    DOW_PT_PL[2] = "terças"
+    DOW_PT[3] = "quarta-feira";   DOW_PT_PL[3] = "quartas"
+    DOW_PT[4] = "quinta-feira";   DOW_PT_PL[4] = "quintas"
+    DOW_PT[5] = "sexta-feira";    DOW_PT_PL[5] = "sextas"
+    DOW_PT[6] = "sábado";         DOW_PT_PL[6] = "sábados"
+
+    DOW_NUM["domingo"] = 0
+    DOW_NUM["segunda"] = 1
+    DOW_NUM["terca"]   = 2
+    DOW_NUM["quarta"]  = 3
+    DOW_NUM["quinta"]  = 4
+    DOW_NUM["sexta"]   = 5
+    DOW_NUM["sabado"]  = 6
+}
+
+# ---------------------------------------------------------------------------
+# normalize_day — remove acentos, plural, "-feira"; retorna forma canônica
+# ---------------------------------------------------------------------------
+function normalize_day(s,    n) {
+    n = tolower(s)
+    gsub(/á|à|â|ã/, "a", n); gsub(/é|ê/, "e", n)
+    gsub(/í|î/,     "i", n); gsub(/ó|ô|õ/, "o", n)
+    gsub(/ú|û/,     "u", n); gsub(/ç/, "c", n)
+    gsub(/-feira$/, "", n);   sub(/s$/, "", n)
+    return n
+}
+
+function dow_num(name,    n) {
+    n = normalize_day(name)
+    return (n in DOW_NUM) ? DOW_NUM[n] : -1
+}
+
+# ===========================================================================
+# mf — verifica se val satisfaz campo cron spec (*, */N, N, N-M)
+# ===========================================================================
+function mf(spec, val,    r) {
+    if (spec == "*") return 1
+    if (substr(spec, 1, 2) == "*/") return (val % (substr(spec, 3) + 0) == 0)
+    if (spec ~ /^[0-9]+-[0-9]+$/) {
+        split(spec, r, "-")
+        return (val >= r[1]+0 && val <= r[2]+0)
+    }
+    return (spec + 0 == val)
+}
+
+# ===========================================================================
+# cron_to_human
+# skip > 1 → "a cada skip DOW_PT_PL[dow]"
+# ===========================================================================
+function cron_to_human(expr, skip,    p, min, hour, dom, month, dow, N, w) {
+    if (expr == "* * * * *")     return "a cada minuto"
+    if (expr == "0 * * * *")     return "a cada hora"
+    if (expr == "0 0 * * *")     return "diariamente"
+    if (expr == "0 0 1 * *")     return "mensalmente"
+    if (expr == "0 0 28-31 * *") return "último dia do mês"
+
+    split(expr, p, " ")
+    min = p[1]; hour = p[2]; dom = p[3]; month = p[4]; dow = p[5]
+
+    if (match(min, /^\*\/([0-9]+)$/, p) && hour=="*" && dom=="*" && month=="*" && dow=="*")
+        return "a cada " p[1] " minutos"
+    if (min=="0" && match(hour, /^\*\/([0-9]+)$/, p) && dom=="*" && month=="*" && dow=="*")
+        return "a cada " p[1] " horas"
+    if (min=="0" && hour=="0" && match(dom, /^\*\/([0-9]+)$/, p) && month=="*" && dow=="*") {
+        N = p[1]+0
+        if (N % 7 == 0) { w = int(N/7); return (w == 1) ? "semanalmente" : "a cada " w " semanas" }
+        return "a cada " N " dias"
+    }
+    if (min=="0" && hour=="0" && dom=="1" && match(month, /^\*\/([0-9]+)$/, p) && dow=="*")
+        return "a cada " p[1] " meses"
+    if (min=="0" && hour=="0" && dom ~ /^[0-9]+$/ && month=="*" && dow=="*")
+        return "no dia " dom " de cada mês"
+    if (min=="0" && hour=="0" && dom=="*" && month=="*" && dow ~ /^[0-6]$/) {
+        if (skip+0 > 1) return "a cada " skip " " DOW_PT_PL[dow+0]
+        return "toda " DOW_PT[dow+0]
+    }
+    return expr
+}
+
+# ===========================================================================
+# crontab_read — retorna string com todo o crontab atual
+# ===========================================================================
+function crontab_read(    line, result) {
+    result = ""
+    while (("crontab -l 2>/dev/null" | getline line) > 0)
+        result = result line "\n"
+    close("crontab -l 2>/dev/null")
+    return result
+}
+
+# ===========================================================================
+# read_jobs_from — analisa string de crontab e retorna TSV:
+#   id \t cron \t cmd \t logfile \t skip
+# Metadados no comentário: # sched-id:N | sched-skip:N | sched-log:p | sched-cmd:cmd
+# ===========================================================================
+function read_jobs_from(ct,    n, lines, i, line, id, logfile, dcmd, skip, np, parts, cron, j, result, ma, mb, mc) {
+    n = split(ct, lines, "\n")
+    id = ""; logfile = ""; dcmd = ""; skip = 0; result = ""
+
+    for (i = 1; i <= n; i++) {
+        line = lines[i]
+
+        if (line ~ /^# sched-id:/) {
+            id      = match(line, /sched-id:([0-9]+)/, ma)    ? ma[1]   : ""
+            logfile = match(line, /sched-log:([^ |]+)/, mb)   ? mb[1]   : ""
+            dcmd    = match(line, /sched-cmd:(.+)$/, mc)      ? mc[1]   : ""
+            skip    = match(line, /sched-skip:([0-9]+)/, ma)  ? ma[1]+0 : 0
+            continue
+        }
+        if (line !~ /^#/ && line != "") {
+            if (id != "") {
+                np = split(line, parts, " ")
+                cron = parts[1]" "parts[2]" "parts[3]" "parts[4]" "parts[5]
+                if (dcmd == "") {
+                    dcmd = ""
+                    for (j = 6; j <= np; j++) dcmd = dcmd (j > 6 ? " " : "") parts[j]
+                }
+                result = result id "\t" cron "\t" dcmd "\t" logfile "\t" skip "\n"
+            }
+            id = ""; logfile = ""; dcmd = ""; skip = 0
+            continue
+        }
+        id = ""; logfile = ""; dcmd = ""; skip = 0
+    }
+    return result
+}
+
+function read_jobs() { return read_jobs_from(crontab_read()) }
+
+# ===========================================================================
+# next_exec_cron — próxima execução (dd/mm HH:MM) dado expressão cron de 5 campos
+# ===========================================================================
+function next_exec_cron(cron_expr,    p, cmin, chour, cdom, cmon, cdow, t, dt, m, h, d, mo, dw, i) {
+    split(cron_expr, p, " ")
+    cmin = p[1]; chour = p[2]; cdom = p[3]; cmon = p[4]; cdow = p[5]
+    t = systime(); t = t + 60 - (t % 60)
+    for (i = 0; i < 527040; i++) {
+        split(strftime("%M %H %d %m %w", t), dt, " ")
+        m = dt[1]+0; h = dt[2]+0; d = dt[3]+0; mo = dt[4]+0; dw = dt[5]+0
+        if (!mf(cmin,  m))                { t += 60;                 continue }
+        if (!mf(chour, h))                { t += (60-m)*60;          continue }
+        if (!mf(cdom,d) || !mf(cdow,dw)) { t += (1440-h*60-m)*60;  continue }
+        if (!mf(cmon,  mo))               { t += (32-d)*86400;       continue }
+        return strftime("%d/%m %H:%M", t)
+    }
+    return "?"
+}
+
+# ===========================================================================
+# last_exec_log — última execução registrada no log (linha [ts])
+# ===========================================================================
+function last_exec_log(logfile,    line, last, ma) {
+    if (logfile == "") return "-"
+    last = ""
+    while ((getline line < logfile) > 0)
+        if (match(line, /^\[([0-9-]+ [0-9:]+)\]/, ma)) last = ma[1]
+    close(logfile)
+    return (last != "") ? last : "-"
+}
+
+# ===========================================================================
+# find_job_by_id — preenche globais FOUND, FOUND_CRON, FOUND_CMD, FOUND_LOG, FOUND_SKIP
+# ===========================================================================
+function find_job_by_id(target, jobs,    n, lines, i, np, parts) {
+    FOUND = 0; FOUND_CRON = ""; FOUND_CMD = ""; FOUND_LOG = ""; FOUND_SKIP = 0
+    n = split(jobs, lines, "\n")
+    for (i = 1; i <= n; i++) {
+        if (lines[i] == "") continue
+        np = split(lines[i], parts, "\t")
+        if (parts[1] == target) {
+            FOUND      = 1
+            FOUND_CRON = parts[2]
+            FOUND_CMD  = parts[3]
+            FOUND_LOG  = parts[4]
+            FOUND_SKIP = (np >= 5) ? parts[5]+0 : 0
+            return
+        }
+    }
+}
+
+# ===========================================================================
+# delete_and_renumber — remove job com target ID e renumera os restantes
+# ct: conteúdo do crontab já lido (evita segunda chamada ao sistema)
+# ===========================================================================
+function delete_and_renumber(target, ct,    n, lines, i, line, skip_next, c, result, ma) {
+    n = split(ct, lines, "\n")
+    skip_next = 0; c = 0; result = ""
+    for (i = 1; i <= n; i++) {
+        line = lines[i]
+        if (match(line, /^# sched-id:([0-9]+)/, ma)) {
+            if (ma[1] == target) { skip_next = 1; continue }
+            c++
+            sub(/sched-id:[0-9]+/, "sched-id:" c, line)
+            result = result line "\n"; continue
+        }
+        if (skip_next) { skip_next = 0; continue }
+        result = result line "\n"
+    }
+    return result
+}
+
+# ===========================================================================
+# confirm — retorna 1 se confirmado, 0 caso contrário
+# ===========================================================================
+function confirm(prompt,    answer) {
+    if (AUTO_YES) { printf "%ss (automático)\n", prompt; return 1 }
+    printf "%s", prompt
+    answer = ""
+    getline answer < "/dev/stdin"
+    return (answer ~ /^[sSyY]/)
+}
+
+# ===========================================================================
+# detect_flags — preenche AUTO_YES, LOG_FILE, CLEANED_ARGS[0..N_CLEANED-1]
+# ===========================================================================
+function detect_flags(    i, tok, a) {
+    AUTO_YES = 0; LOG_FILE = ""; N_CLEANED = 0
+    for (i = 0; i < N_ARGS; i++) {
+        tok = ARGS[i]
+        if (tok == "-s" || tok == "--sim") {
+            AUTO_YES = 1
+        } else if (tok == "--log") {
+            if (i+1 < N_ARGS) {
+                a = ARGS[++i]
+                if (substr(a, 1, 1) != "/") a = "/tmp/sched/" a
+                LOG_FILE = a
+            } else {
+                printf "Erro: \"--log\" requer um caminho.\n" > "/dev/stderr"; exit 1
+            }
+        } else {
+            CLEANED_ARGS[N_CLEANED++] = tok
+        }
+    }
+}
+
+# ===========================================================================
+# parse_frequency — preenche CRON_EXPR, EOM_FLAG, SKIP, SKIP_REF, REMAINING[]
+#
+# Frequências suportadas:
+#   diariamente | todo dia | mensalmente | mensal | semanalmente
+#   por hora | a cada hora | a cada minuto | a cada semana
+#   a cada N minutos|horas|dias|semanas|meses
+#   fim do mês | fim de mês | último dia [do mês]
+#   no dia N | dia N                           (N entre 1 e 28)
+#   toda/todo <dia-da-semana>
+#   a cada N <dia-da-semana-plural>
+# ===========================================================================
+function parse_frequency(    i, tok, after, N, ai, ui, tok2, dw) {
+    CRON_EXPR = ""; EOM_FLAG = 0; SKIP = 0; SKIP_REF = 0; N_REMAINING = 0
+    i = 0
+
+    while (i < N_CLEANED) {
+        tok = CLEANED_ARGS[i]
+
+        # --- frequências simples ---
+        if (tok == "mensalmente" || tok == "mensal")
+            { CRON_EXPR = "0 0 1 * *"; i++; break }
+        if (tok == "diariamente")
+            { CRON_EXPR = "0 0 * * *"; i++; break }
+        if (tok == "semanalmente")
+            { CRON_EXPR = "0 0 * * 0"; i++; break }
+        if (tok == "todo" && i+1 < N_CLEANED && CLEANED_ARGS[i+1] == "dia")
+            { CRON_EXPR = "0 0 * * *"; i += 2; break }
+        if (tok == "por" && i+1 < N_CLEANED && CLEANED_ARGS[i+1] == "hora")
+            { CRON_EXPR = "0 * * * *"; i += 2; break }
+
+        # --- fim do mês ---
+        if (tok == "fim" && i+2 < N_CLEANED &&
+            (CLEANED_ARGS[i+1] == "do" || CLEANED_ARGS[i+1] == "de") &&
+            (CLEANED_ARGS[i+2] == "mês" || CLEANED_ARGS[i+2] == "mes"))
+            { CRON_EXPR = "0 0 28-31 * *"; EOM_FLAG = 1; i += 3; break }
+
+        if ((tok == "último" || tok == "ultimo") &&
+            i+1 < N_CLEANED && CLEANED_ARGS[i+1] == "dia") {
+            CRON_EXPR = "0 0 28-31 * *"; EOM_FLAG = 1; i += 2
+            # opcional: "... do mês"
+            if (i+1 < N_CLEANED && CLEANED_ARGS[i] == "do" &&
+                (CLEANED_ARGS[i+1] == "mês" || CLEANED_ARGS[i+1] == "mes")) i += 2
+            break
+        }
+
+        # --- no dia N / dia N ---
+        if (tok == "no" && i+1 < N_CLEANED && CLEANED_ARGS[i+1] == "dia") {
+            i++; tok = "dia"
+        }
+        if (tok == "dia" && i+1 < N_CLEANED && CLEANED_ARGS[i+1] ~ /^[0-9]+$/) {
+            N = CLEANED_ARGS[i+1]+0
+            if (N < 1 || N > 28) {
+                printf "Erro: dia deve ser entre 1 e 28 (válido em todos os meses).\n" > "/dev/stderr"
+                exit 1
+            }
+            CRON_EXPR = "0 0 " N " * *"; i += 2; break
+        }
+
+        # --- toda/todo <dia-da-semana> ---
+        if ((tok == "toda" || tok == "todo") && i+1 < N_CLEANED) {
+            dw = dow_num(CLEANED_ARGS[i+1])
+            if (dw >= 0) { CRON_EXPR = "0 0 * * " dw; i += 2; break }
+        }
+
+        # --- a cada ... ---
+        if (tok == "a" && i+1 < N_CLEANED && CLEANED_ARGS[i+1] == "cada") {
+            ai = i + 2
+            if (ai < N_CLEANED) {
+                after = CLEANED_ARGS[ai]
+                if (after == "hora")   { CRON_EXPR = "0 * * * *"; i = ai+1; break }
+                if (after == "minuto") { CRON_EXPR = "* * * * *"; i = ai+1; break }
+                if (after == "semana") { CRON_EXPR = "0 0 * * 0"; i = ai+1; break }
+
+                if (after ~ /^[0-9]+$/) {
+                    N = after+0; ui = ai+1
+                    if (ui < N_CLEANED) {
+                        tok2 = CLEANED_ARGS[ui]
+                        if (tok2 ~ /^minuto/)  { CRON_EXPR = "*/" N " * * * *";       i = ui+1; break }
+                        if (tok2 ~ /^hora/)    { CRON_EXPR = "0 */" N " * * *";       i = ui+1; break }
+                        if (tok2 ~ /^dia/)     { CRON_EXPR = "0 0 */" N " * *";       i = ui+1; break }
+                        if (tok2 ~ /^semana/)  { CRON_EXPR = "0 0 */" (N*7) " * *";  i = ui+1; break }
+                        if (tok2 ~ /^m[eê]s/ || tok2 == "meses") {
+                            CRON_EXPR = "0 0 1 */" N " *"; i = ui+1; break
+                        }
+                        # a cada N <dia-da-semana-plural>
+                        dw = dow_num(tok2)
+                        if (dw >= 0) {
+                            CRON_EXPR = "0 0 * * " dw
+                            SKIP      = N
+                            SKIP_REF  = int(systime() / 604800) % N
+                            i = ui+1; break
+                        }
+                    }
+                }
+            }
+        }
+
+        break   # token não reconhecido
+    }
+
+    if (CRON_EXPR == "") {
+        printf "Erro: frequência não reconhecida ou ausente.\n" > "/dev/stderr"
+        usage_stderr(); exit 1
+    }
+
+    for (; i < N_CLEANED; i++) REMAINING[N_REMAINING++] = CLEANED_ARGS[i]
+
+    if (N_REMAINING == 0) {
+        printf "Erro: nenhum comando especificado após a frequência.\n" > "/dev/stderr"
+        usage_stderr(); exit 1
+    }
+}
+
+# ===========================================================================
+# usage
+# ===========================================================================
+function usage() {
+    print "sched — Gerenciador de agendamentos (cron) em português"
+    print ""
+    print "Uso:"
+    print "  sched rodar <frequência> <comando> [opções]"
+    print "  sched listar"
+    print "  sched descreva <id>"
+    print "  sched deletar [id] [-s | --sim]"
+    print "  sched ajuda"
+    print ""
+    print "Opções do rodar:"
+    print "  -s / --sim          Agenda sem pedir confirmação"
+    print "  --log <arquivo>     Salva saída em arquivo de log;"
+    print "                      caminho relativo vai para /tmp/sched/"
+    print ""
+    print "Frequências suportadas:"
+    print "  a cada N minutos    a cada N horas      a cada N dias"
+    print "  a cada N semanas    a cada hora         por hora"
+    print "  a cada semana       semanalmente        diariamente"
+    print "  todo dia            mensalmente         mensal"
+    print "  fim do mês          último dia do mês"
+    print "  no dia N            dia N               (N entre 1 e 28)"
+    print "  toda segunda        toda terça          toda quarta ..."
+    print "  toda segunda-feira  toda quinta-feira   ..."
+    print "  a cada 2 segundas   a cada 3 terças     ..."
+    print ""
+    print "Exemplos:"
+    print "  sched rodar diariamente backup.sh --log backup.log"
+    print "  sched rodar a cada 2 horas verifica.sh"
+    print "  sched rodar fim do mês relatorio.sh --sim --log relatorio.log"
+    print "  sched rodar no dia 15 pagamento.sh"
+    print "  sched rodar toda segunda reuniao.sh"
+    print "  sched rodar a cada 2 semanas reset-trial.sh --sim"
+    print "  sched listar"
+    print "  sched deletar 3 --sim"
+}
+
+function usage_stderr() {
+    print "sched — Gerenciador de agendamentos (cron) em português" > "/dev/stderr"
+    print "" > "/dev/stderr"
+    print "Uso:" > "/dev/stderr"
+    print "  sched rodar <frequência> <comando> [opções]" > "/dev/stderr"
+    print "  sched listar" > "/dev/stderr"
+    print "  sched descreva <id>" > "/dev/stderr"
+    print "  sched deletar [id] [-s | --sim]" > "/dev/stderr"
+    print "  sched ajuda" > "/dev/stderr"
+}
+
+# ===========================================================================
+# cmd_listar
+# ===========================================================================
+function cmd_listar(    jobs, n, lines, i, parts, freq, nxt, col_cmd) {
+    jobs = read_jobs()
+    if (jobs == "") { print "Nenhum agendamento gerenciado pelo sched."; return }
+
+    print "Agendamentos:"
+    print ""
+    col_cmd = "column -t -s '\t'"
+    printf "ID\tFrequência\tPróxima Execução\tComando\tLog\n" | col_cmd
+    n = split(jobs, lines, "\n")
+    for (i = 1; i <= n; i++) {
+        if (lines[i] == "") continue
+        split(lines[i], parts, "\t")
+        freq = cron_to_human(parts[2], parts[5]+0)
+        nxt  = next_exec_cron(parts[2])
+        printf "#%s\t%s\t%s\t%s\t%s\n",
+            parts[1], freq, nxt, parts[3],
+            (parts[4] != "" ? parts[4] : "-") | col_cmd
+    }
+    close(col_cmd)
+}
+
+# ===========================================================================
+# cmd_descreva
+# ===========================================================================
+function cmd_descreva(    target_id, jobs, freq, nxt, last) {
+    target_id = (N_ARGS > 0) ? ARGS[0] : ""
+    if (target_id == "") { printf "Uso: sched descreva <id>\n" > "/dev/stderr"; exit 1 }
+
+    jobs = read_jobs()
+    if (jobs == "") { print "Nenhum agendamento encontrado." > "/dev/stderr"; exit 1 }
+
+    find_job_by_id(target_id, jobs)
+    if (!FOUND) { printf "Erro: ID #%s não encontrado.\n", target_id > "/dev/stderr"; exit 1 }
+
+    freq = cron_to_human(FOUND_CRON, FOUND_SKIP)
+    nxt  = next_exec_cron(FOUND_CRON)
+    last = last_exec_log(FOUND_LOG)
+
+    print ""
+    printf "Agendamento #%s\n", target_id
+    print "  ----------------------------------------"
+    printf "  Frequência       : %s\n", freq
+    printf "  Expressão cron   : %s\n", FOUND_CRON
+    printf "  Próxima execução : %s\n", nxt
+    printf "  Última execução  : %s\n", last
+    printf "  Comando          : %s\n", FOUND_CMD
+    printf "  Log              : %s\n", (FOUND_LOG != "" ? FOUND_LOG : "-")
+    print ""
+}
+
+# ===========================================================================
+# cmd_rodar
+# ===========================================================================
+function cmd_rodar(    command, ct, next_id, ctlines, n, i, cmd_cron, logdir, label_esc,
+                       freq_human, comment, cmd_cron_safe, ma) {
+    if (N_ARGS == 0) {
+        printf "Erro: informe a frequência e o comando.\n" > "/dev/stderr"
+        usage_stderr(); exit 1
+    }
+
+    detect_flags()
+    parse_frequency()
+
+    command = ""
+    for (i = 0; i < N_REMAINING; i++) command = command (i > 0 ? " " : "") REMAINING[i]
+
+    # Determina próximo ID
+    ct = crontab_read()
+    next_id = 1
+    n = split(ct, ctlines, "\n")
+    for (i = 1; i <= n; i++)
+        if (match(ctlines[i], /sched-id:([0-9]+)/, ma) && ma[1]+0 >= next_id)
+            next_id = ma[1]+0 + 1
+
+    # Monta o comando que vai para o crontab
+    cmd_cron = command
+
+    if (LOG_FILE != "") {
+        logdir = LOG_FILE; sub(/\/[^\/]+$/, "", logdir)
+        label_esc = command; gsub(/"/, "\\\"", label_esc)
+        cmd_cron = "mkdir -p " logdir \
+            " && { echo \"[$(date '+%Y-%m-%d %H:%M:%S')] " label_esc "\"; " \
+            cmd_cron "; echo '---'; } >> " LOG_FILE " 2>&1"
+    }
+
+    # Wrapper de fim de mês: só executa no último dia do mês
+    if (EOM_FLAG)
+        cmd_cron = "[ \"$(date -d '+1 day' +%d)\" = \"01\" ] && { " cmd_cron "; }"
+
+    # Wrapper de skip: executa a cada SKIP semanas no dia configurado
+    if (SKIP > 1)
+        cmd_cron = "[ $(( ( $(date +%s) / 604800 ) % " SKIP " )) -eq " SKIP_REF \
+                   " ] && { " cmd_cron "; }"
+
+    # Preview para o usuário
+    freq_human = cron_to_human(CRON_EXPR, SKIP)
+    print ""
+    print "Novo agendamento:"
+    printf "  Frequência : %s\n", freq_human
+    printf "  Comando    : %s\n", command
+    if (LOG_FILE != "") printf "  Log        : %s\n", LOG_FILE
+    if (AUTO_YES)        printf "  Modo       : sem confirmação (-s)\n"
+    printf "  ID         : #%s\n", next_id
+    print ""
+
+    if (!confirm("Confirmar criação do agendamento? (s/N): ")) {
+        print "Agendamento cancelado."; return
+    }
+
+    # Monta comentário de metadados (sched-cmd sempre por último — pode conter "|")
+    comment = "# sched-id:" next_id
+    if (SKIP > 1)       comment = comment " | sched-skip:" SKIP
+    if (LOG_FILE != "") comment = comment " | sched-log:" LOG_FILE
+    comment = comment " | sched-cmd:" command
+
+    # Escapa % (especial no crontab — vira newline)
+    cmd_cron_safe = cmd_cron; gsub(/%/, "\\%", cmd_cron_safe)
+
+    printf "%s", ct          > TMPFILE
+    printf "%s\n", comment   > TMPFILE
+    printf "%s %s\n", CRON_EXPR, cmd_cron_safe > TMPFILE
+    close(TMPFILE)
+    system("crontab " TMPFILE)
+
+    printf "Agendamento #%s criado com sucesso.\n", next_id
+    if (LOG_FILE != "") printf "  Log em: %s\n  Ver: tail -f %s\n", LOG_FILE, LOG_FILE
+}
+
+# ===========================================================================
+# cmd_deletar
+# ===========================================================================
+function cmd_deletar(    target_id, i, tok, ct, jobs, freq_human, new_ct) {
+    AUTO_YES = 0; target_id = ""
+
+    for (i = 0; i < N_ARGS; i++) {
+        tok = ARGS[i]
+        if (tok == "-s" || tok == "--sim") AUTO_YES = 1
+        else if (tok ~ /^[0-9]+$/ && target_id == "") target_id = tok
+    }
+
+    if (target_id == "") {
+        cmd_listar(); print ""
+        printf "ID a deletar (Enter para cancelar): "
+        target_id = ""
+        getline target_id < "/dev/stdin"
+        if (target_id == "") { print "Cancelado."; return }
+    }
+
+    if (target_id !~ /^[0-9]+$/) {
+        printf "Erro: ID deve ser numérico.\n" > "/dev/stderr"; exit 1
+    }
+
+    ct   = crontab_read()
+    jobs = read_jobs_from(ct)
+    if (jobs == "") { print "Nenhum agendamento encontrado." > "/dev/stderr"; exit 1 }
+
+    find_job_by_id(target_id, jobs)
+    if (!FOUND) { printf "Erro: ID #%s não encontrado.\n", target_id > "/dev/stderr"; exit 1 }
+
+    freq_human = cron_to_human(FOUND_CRON, FOUND_SKIP)
+    print ""
+    printf "Deletar agendamento #%s\n", target_id
+    printf "  Frequência : %s\n", freq_human
+    printf "  Comando    : %s\n", FOUND_CMD
+    if (FOUND_LOG != "") printf "  Log        : %s\n", FOUND_LOG
+    print ""
+
+    if (!confirm("Confirmar exclusão? (s/N): ")) { print "Cancelado."; return }
+
+    new_ct = delete_and_renumber(target_id, ct)
+    printf "%s", new_ct > TMPFILE
+    close(TMPFILE)
+    system("crontab " TMPFILE)
+    printf "Agendamento #%s deletado.\n", target_id
+}
