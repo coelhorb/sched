@@ -13,7 +13,7 @@ sched rodar no dia 15 pagamento.sh
 
 ## Dependências
 
-- `gawk` ≥ 4.0
+- `gawk`, `mawk` ≥ 1.3.4, ou qualquer awk com suporte a `strftime`/`systime`
 - `crontab` (qualquer implementação POSIX)
 - `column` (util-linux)
 
