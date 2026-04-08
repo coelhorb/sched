@@ -9,6 +9,8 @@ sched rodar toda segunda às 09:00 backup.sh
 sched rodar fim do mês relatorio.sh
 sched rodar a cada 2 horas verifica.sh
 sched rodar no dia 15 às 08:30 pagamento.sh
+sched rodar hoje às 18:00 backup.sh
+sched rodar dia 20/04 às 14:00 script.sh
 ```
 
 ## Dependências
@@ -78,9 +80,13 @@ Quando o horário é omitido, o padrão é **12:00** (meio-dia).
 | `mensalmente` / `mensal` | — |
 | `fim do mês` / `fim de mês` | último dia real do mês |
 | `último dia do mês` | idem |
-| `no dia N` / `dia N` | N entre 1 e 28 |
+| `no dia N` / `dia N` | N entre 1 e 28, recorrente todo mês |
 | `toda segunda` … `toda domingo` | com ou sem acento, com ou sem `-feira` |
 | `a cada 2 segundas` … | a cada N semanas no dia especificado |
+| `hoje` | execução única hoje |
+| `amanhã` | execução única amanhã |
+| `dia DD/MM` | execução única na data especificada |
+| `dia DD/MM/AAAA` | execução única na data especificada |
 
 ### Fim de mês
 
@@ -108,6 +114,19 @@ sched rodar toda terça-feira deploy.sh
 sched rodar a cada 2 sextas relatorio.sh
 ```
 
+### Execução única
+
+Para rodar um comando uma única vez, use `hoje`, `amanhã` ou uma data específica. O agendamento se remove automaticamente do crontab após a execução:
+
+```bash
+sched rodar hoje às 18:00 backup.sh
+sched rodar amanhã às 09:30 relatorio.sh
+sched rodar dia 20/04 às 14:00 script.sh
+sched rodar dia 20/04/2026 às 14:00 script.sh
+```
+
+O horário é obrigatório para execuções únicas (não há padrão recorrente que defina quando rodar).
+
 ## Exemplos
 
 ```bash
@@ -129,6 +148,12 @@ sched rodar toda segunda às 09:00 reuniao.sh
 # Cobrar clientes quinzenalmente (padrão: meio-dia)
 sched rodar a cada 2 semanas cobranca.sh
 
+# Execução única hoje às 18h
+sched rodar hoje às 18:00 backup.sh
+
+# Execução única em data específica
+sched rodar dia 20/04 às 14:00 script.sh
+
 # Listar agendamentos
 sched listar
 
@@ -144,12 +169,13 @@ sched deletar 3 --sim
 ```
 Agendamentos:
 
-ID  Frequência                    Próxima Execução  Comando       Log
-#1  diariamente às 03:00          08/04 03:00       backup.sh     /tmp/sched/backup.log
-#2  último dia do mês ao meio-dia 30/04 12:00       relatorio.sh  -
-#3  toda segunda-feira às 09:00   13/04 09:00       reuniao.sh    -
-#4  a cada 2 semanas ao meio-dia  21/04 12:00       cobranca.sh   -
-#5  no dia 15 de cada mês às 10:00 15/04 10:00      pagamento.sh  -
+ID  Frequência                      Próxima Execução  Comando       Log
+#1  diariamente às 03:00            08/04 03:00       backup.sh     /tmp/sched/backup.log
+#2  último dia do mês ao meio-dia   30/04 12:00       relatorio.sh  -
+#3  toda segunda-feira às 09:00     13/04 09:00       reuniao.sh    -
+#4  a cada 2 semanas ao meio-dia    21/04 12:00       cobranca.sh   -
+#5  no dia 15 de cada mês às 10:00  15/04 10:00       pagamento.sh  -
+#6  uma vez em 20/04 às 14:00       20/04 14:00       script.sh     -
 ```
 
 ## Como funciona
@@ -160,6 +186,8 @@ O `sched` armazena metadados como comentários diretamente no crontab do usuári
 # sched-id:1 | sched-log:/tmp/sched/backup.log | sched-cmd:backup.sh
 0 3 * * * mkdir -p /tmp/sched && { echo "[...] backup.sh"; backup.sh; echo '---'; } >> /tmp/sched/backup.log 2>&1
 ```
+
+Para execuções únicas, o comando no crontab inclui um wrapper de auto-remoção que apaga o próprio agendamento após a execução. O `listar` exibe apenas o comando original — o wrapper fica transparente.
 
 Os IDs são renumerados automaticamente ao deletar entradas. Linhas do crontab que não foram criadas pelo `sched` são preservadas intactas.
 

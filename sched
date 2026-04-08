@@ -117,6 +117,8 @@ function cron_to_human(expr, skip,    p, min, hour, dom, month, dow, N, w, ts) {
     # Expressões baseadas em dias: inclui sufixo de horário
     ts = time_suffix(min, hour)
 
+    if (min ~ /^[0-9]+$/ && hour ~ /^[0-9]+$/ && dom ~ /^[0-9]+$/ && month ~ /^[0-9]+$/ && dow == "*")
+        return sprintf("uma vez em %02d/%02d", dom+0, month+0) ts
     if (min ~ /^[0-9]+$/ && hour ~ /^[0-9]+$/ && dom=="*" && month=="*" && dow=="*")
         return "diariamente" ts
     if (min ~ /^[0-9]+$/ && hour ~ /^[0-9]+$/ && dom ~ /^\*\/[0-9]+$/ && month=="*" && dow=="*") {
@@ -351,8 +353,8 @@ function parse_time(    tok, tok2, h, m, tp, consumed, _i) {
 #   toda/todo <dia-da-semana>
 #   a cada N <dia-da-semana-plural>
 # ===========================================================================
-function parse_frequency(    i, tok, after, N, ai, ui, tok2, dw) {
-    CRON_EXPR = ""; EOM_FLAG = 0; SKIP = 0; SKIP_REF = 0; N_REMAINING = 0
+function parse_frequency(    i, tok, after, N, ai, ui, tok2, dw, td) {
+    CRON_EXPR = ""; EOM_FLAG = 0; ONE_TIME = 0; SKIP = 0; SKIP_REF = 0; N_REMAINING = 0
     i = 0
 
     while (i < N_CLEANED) {
@@ -385,17 +387,40 @@ function parse_frequency(    i, tok, after, N, ai, ui, tok2, dw) {
             break
         }
 
-        # --- no dia N / dia N ---
+        # --- hoje / amanhã ---
+        if (tok == "hoje") {
+            split(strftime("%d %m", systime()), td, " ")
+            CRON_EXPR = "0 0 " (td[1]+0) " " (td[2]+0) " *"
+            ONE_TIME = 1; i++; break
+        }
+        if (tok == "amanhã" || tok == "amanha") {
+            split(strftime("%d %m", systime() + 86400), td, " ")
+            CRON_EXPR = "0 0 " (td[1]+0) " " (td[2]+0) " *"
+            ONE_TIME = 1; i++; break
+        }
+
+        # --- no dia N / dia N / dia DD/MM[/AAAA] ---
         if (tok == "no" && i+1 < N_CLEANED && CLEANED_ARGS[i+1] == "dia") {
             i++; tok = "dia"
         }
-        if (tok == "dia" && i+1 < N_CLEANED && CLEANED_ARGS[i+1] ~ /^[0-9]+$/) {
-            N = CLEANED_ARGS[i+1]+0
-            if (N < 1 || N > 28) {
-                printf "Erro: dia deve ser entre 1 e 28 (válido em todos os meses).\n" > "/dev/stderr"
-                exit 1
+        if (tok == "dia" && i+1 < N_CLEANED) {
+            if (CLEANED_ARGS[i+1] ~ /^[0-9]+\/[0-9]/) {
+                split(CLEANED_ARGS[i+1], td, "/")
+                N = td[1]+0
+                if (N < 1 || N > 31 || td[2]+0 < 1 || td[2]+0 > 12) {
+                    printf "Erro: data inválida \"%s\".\n", CLEANED_ARGS[i+1] > "/dev/stderr"; exit 1
+                }
+                CRON_EXPR = "0 0 " N " " (td[2]+0) " *"
+                ONE_TIME = 1; i += 2; break
             }
-            CRON_EXPR = "0 0 " N " * *"; i += 2; break
+            if (CLEANED_ARGS[i+1] ~ /^[0-9]+$/) {
+                N = CLEANED_ARGS[i+1]+0
+                if (N < 1 || N > 28) {
+                    printf "Erro: dia deve ser entre 1 e 28 (válido em todos os meses).\n" > "/dev/stderr"
+                    exit 1
+                }
+                CRON_EXPR = "0 0 " N " * *"; i += 2; break
+            }
         }
 
         # --- toda/todo <dia-da-semana> ---
@@ -477,10 +502,14 @@ function usage() {
     print "  a cada semana       semanalmente        diariamente"
     print "  todo dia            mensalmente         mensal"
     print "  fim do mês          último dia do mês"
-    print "  no dia N            dia N               (N entre 1 e 28)"
+    print "  no dia N            dia N               (N entre 1 e 28, recorrente)"
     print "  toda segunda        toda terça          toda quarta ..."
     print "  toda segunda-feira  toda quinta-feira   ..."
     print "  a cada 2 segundas   a cada 3 terças     ..."
+    print ""
+    print "Execução única (requer horário):"
+    print "  hoje                amanhã"
+    print "  dia DD/MM           dia DD/MM/AAAA"
     print ""
     print "Exemplos:"
     print "  sched rodar diariamente backup.sh --log backup.log"
@@ -491,6 +520,10 @@ function usage() {
     print "  sched rodar no dia 15 pagamento.sh"
     print "  sched rodar toda segunda às 09:00 reuniao.sh"
     print "  sched rodar a cada 2 semanas reset-trial.sh --sim"
+    print "  sched rodar hoje às 18:00 backup.sh"
+    print "  sched rodar amanhã às 09:30 relatorio.sh"
+    print "  sched rodar dia 20/04 às 14:00 script.sh"
+    print "  sched rodar dia 20/04/2026 às 14:00 script.sh"
     print "  sched listar"
     print "  sched deletar 3 --sim"
 }
@@ -609,6 +642,12 @@ function cmd_rodar(    command, ct, next_id, ctlines, n, i, cmd_cron, logdir, la
     if (SKIP > 1)
         cmd_cron = "[ $(( ( $(date +%s) / 604800 ) % " SKIP " )) -eq " SKIP_REF \
                    " ] && { " cmd_cron "; }"
+
+    # Wrapper de uma vez: auto-remove após execução
+    if (ONE_TIME) {
+        remove_me = "crontab -l 2>/dev/null | awk 'BEGIN{s=0}/^# sched-id:" next_id "[^0-9]/{s=1;next}s{s=0;next}{print}' | crontab -"
+        cmd_cron = "{ " cmd_cron "; }; " remove_me
+    }
 
     # Preview para o usuário
     freq_human = cron_to_human(CRON_EXPR, SKIP)
