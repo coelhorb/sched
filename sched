@@ -85,10 +85,21 @@ function mf(spec, val,    r) {
 }
 
 # ===========================================================================
+# time_suffix — retorna string de horário para descrições humanas
+# ===========================================================================
+function time_suffix(min, hour,    h, m) {
+    if (min !~ /^[0-9]+$/ || hour !~ /^[0-9]+$/) return ""
+    h = hour+0; m = min+0
+    if (m == 0 && h == 0)  return " à meia-noite"
+    if (m == 0 && h == 12) return " ao meio-dia"
+    return sprintf(" às %02d:%02d", h, m)
+}
+
+# ===========================================================================
 # cron_to_human
 # skip > 1 → "a cada skip DOW_PT_PL[dow]"
 # ===========================================================================
-function cron_to_human(expr, skip,    p, min, hour, dom, month, dow, N, w) {
+function cron_to_human(expr, skip,    p, min, hour, dom, month, dow, N, w, ts) {
     if (expr == "* * * * *")     return "a cada minuto"
     if (expr == "0 * * * *")     return "a cada hora"
     if (expr == "0 0 * * *")     return "diariamente"
@@ -98,23 +109,31 @@ function cron_to_human(expr, skip,    p, min, hour, dom, month, dow, N, w) {
     split(expr, p, " ")
     min = p[1]; hour = p[2]; dom = p[3]; month = p[4]; dow = p[5]
 
-    if (match(min, /^\*\/[0-9]+$/) && hour=="*" && dom=="*" && month=="*" && dow=="*")
+    if (min ~ /^\*\/[0-9]+$/ && hour=="*" && dom=="*" && month=="*" && dow=="*")
         return "a cada " substr(min, 3) " minutos"
-    if (min=="0" && match(hour, /^\*\/[0-9]+$/) && dom=="*" && month=="*" && dow=="*")
+    if (min=="0" && hour ~ /^\*\/[0-9]+$/ && dom=="*" && month=="*" && dow=="*")
         return "a cada " substr(hour, 3) " horas"
-    if (min=="0" && hour=="0" && match(dom, /^\*\/[0-9]+$/) && month=="*" && dow=="*") {
+
+    # Expressões baseadas em dias: inclui sufixo de horário
+    ts = time_suffix(min, hour)
+
+    if (min ~ /^[0-9]+$/ && hour ~ /^[0-9]+$/ && dom=="*" && month=="*" && dow=="*")
+        return "diariamente" ts
+    if (min ~ /^[0-9]+$/ && hour ~ /^[0-9]+$/ && dom ~ /^\*\/[0-9]+$/ && month=="*" && dow=="*") {
         N = substr(dom, 3)+0
-        if (N % 7 == 0) { w = int(N/7); return (w == 1) ? "semanalmente" : "a cada " w " semanas" }
-        return "a cada " N " dias"
+        if (N % 7 == 0) { w = int(N/7); return (w == 1) ? "semanalmente" ts : "a cada " w " semanas" ts }
+        return "a cada " N " dias" ts
     }
-    if (min=="0" && hour=="0" && dom=="1" && match(month, /^\*\/[0-9]+$/) && dow=="*")
-        return "a cada " substr(month, 3) " meses"
-    if (min=="0" && hour=="0" && dom ~ /^[0-9]+$/ && month=="*" && dow=="*")
-        return "no dia " dom " de cada mês"
-    if (min=="0" && hour=="0" && dom=="*" && month=="*" && dow ~ /^[0-6]$/) {
-        if (skip+0 > 1) return "a cada " skip " " DOW_PT_PL[dow+0]
-        return "toda " DOW_PT[dow+0]
+    if (min ~ /^[0-9]+$/ && hour ~ /^[0-9]+$/ && dom=="1" && month ~ /^\*\/[0-9]+$/ && dow=="*")
+        return "a cada " substr(month, 3) " meses" ts
+    if (min ~ /^[0-9]+$/ && hour ~ /^[0-9]+$/ && dom ~ /^[0-9]+$/ && month=="*" && dow=="*")
+        return "no dia " dom " de cada mês" ts
+    if (min ~ /^[0-9]+$/ && hour ~ /^[0-9]+$/ && dom=="*" && month=="*" && dow ~ /^[0-6]$/) {
+        if (skip+0 > 1) return "a cada " skip " " DOW_PT_PL[dow+0] ts
+        return "toda " DOW_PT[dow+0] ts
     }
+    if (min ~ /^[0-9]+$/ && hour ~ /^[0-9]+$/ && dom ~ /^28-31$/ && month=="*" && dow=="*")
+        return "último dia do mês" ts
     return expr
 }
 
@@ -275,6 +294,52 @@ function detect_flags(    i, tok, a) {
 }
 
 # ===========================================================================
+# parse_time — detecta horário opcional em REMAINING[]; padrão = 12:00
+#
+# Reconhece: "às HH:MM"  ou  "HH:MM"  logo após a frequência.
+# Atualiza CRON_EXPR e remove os tokens consumidos de REMAINING[].
+# Só aplica horário em expressões baseadas em dias (campos min e hora fixos).
+# ===========================================================================
+function parse_time(    tok, tok2, h, m, tp, consumed, _i) {
+    consumed = 0; h = 12; m = 0   # padrão: meio-dia
+
+    if (N_REMAINING > 0) {
+        tok = REMAINING[0]
+
+        if (tok == "às" && N_REMAINING > 1) {
+            tok2 = REMAINING[1]
+            if (tok2 ~ /^[0-9]+:[0-9]+$/) {
+                split(tok2, tp, ":")
+                h = tp[1]+0; m = tp[2]+0
+                if (h > 23 || m > 59) {
+                    printf "Erro: horário inválido \"%s\".\n", tok2 > "/dev/stderr"; exit 1
+                }
+                consumed = 2
+            }
+        } else if (tok ~ /^[0-9]+:[0-9]+$/) {
+            split(tok, tp, ":")
+            h = tp[1]+0; m = tp[2]+0
+            if (h > 23 || m > 59) {
+                printf "Erro: horário inválido \"%s\".\n", tok > "/dev/stderr"; exit 1
+            }
+            consumed = 1
+        }
+    }
+
+    # Aplica ao CRON_EXPR somente se for baseado em dias (começa com "0 0")
+    split(CRON_EXPR, tp, " ")
+    if (tp[1] == "0" && tp[2] == "0")
+        CRON_EXPR = m " " h " " tp[3] " " tp[4] " " tp[5]
+
+    # Remove tokens consumidos de REMAINING
+    if (consumed > 0) {
+        for (_i = 0; _i < N_REMAINING - consumed; _i++)
+            REMAINING[_i] = REMAINING[_i + consumed]
+        N_REMAINING -= consumed
+    }
+}
+
+# ===========================================================================
 # parse_frequency — preenche CRON_EXPR, EOM_FLAG, SKIP, SKIP_REF, REMAINING[]
 #
 # Frequências suportadas:
@@ -395,7 +460,7 @@ function usage() {
     print "sched — Gerenciador de agendamentos (cron) em português"
     print ""
     print "Uso:"
-    print "  sched rodar <frequência> <comando> [opções]"
+    print "  sched rodar <frequência> [às HH:MM] <comando> [opções]"
     print "  sched listar"
     print "  sched descreva <id>"
     print "  sched deletar [id] [-s | --sim]"
@@ -419,10 +484,12 @@ function usage() {
     print ""
     print "Exemplos:"
     print "  sched rodar diariamente backup.sh --log backup.log"
+    print "  sched rodar diariamente às 08:30 backup.sh --log backup.log"
     print "  sched rodar a cada 2 horas verifica.sh"
+    print "  sched rodar a cada 10 dias às 14:00 reset-trial.sh --sim"
     print "  sched rodar fim do mês relatorio.sh --sim --log relatorio.log"
     print "  sched rodar no dia 15 pagamento.sh"
-    print "  sched rodar toda segunda reuniao.sh"
+    print "  sched rodar toda segunda às 09:00 reuniao.sh"
     print "  sched rodar a cada 2 semanas reset-trial.sh --sim"
     print "  sched listar"
     print "  sched deletar 3 --sim"
@@ -504,6 +571,12 @@ function cmd_rodar(    command, ct, next_id, ctlines, n, i, cmd_cron, logdir, la
 
     detect_flags()
     parse_frequency()
+    parse_time()   # horário opcional após frequência; padrão = 12:00
+
+    if (N_REMAINING == 0) {
+        printf "Erro: nenhum comando especificado.\n" > "/dev/stderr"
+        usage_stderr(); exit 1
+    }
 
     command = ""
     for (i = 0; i < N_REMAINING; i++) command = command (i > 0 ? " " : "") REMAINING[i]
